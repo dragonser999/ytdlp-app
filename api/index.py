@@ -1,38 +1,3 @@
-"""
-yt-dlp API wrapper with PO Token support, deployable on Vercel.
-
-ARCHITECTURE:
-   Vercel serverless functions can't run a persistent background process,
-   so the PO Token provider (bgutil, a Node.js server) CANNOT live inside
-   this same deployment. Run it separately (e.g. a small Railway/Render/VPS
-   instance) and point this API at it via the POT_PROVIDER_URL env var.
-
-SETUP:
-
-1. Deploy the PO Token provider somewhere with a persistent process
-   (Railway, Render, Fly.io, or any small VPS — NOT Vercel):
-       docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
-   This gives you a public URL, e.g. https://your-pot-provider.up.railway.app
-
-2. In Vercel, set an environment variable:
-       POT_PROVIDER_URL = https://your-pot-provider.up.railway.app
-
-3. Install deps:
-   pip install fastapi uvicorn yt-dlp bgutil-ytdlp-pot-provider
-
-4. Run locally to test:
-   POT_PROVIDER_URL=http://127.0.0.1:4416 python ytdlp_api.py
-   -> visit http://127.0.0.1:8000/docs
-
-ENDPOINTS:
-   GET /info?url=...          -> video metadata + available formats
-   GET /download?url=...&fmt=mp3|mp4  -> direct extracted stream URL
-
-NOTE: even with a PO Token, Vercel's shared IPs may still get rate-limited
-under heavy traffic. If that happens, hosting the whole API (not just the
-PO token provider) outside Vercel is the more reliable fix.
-"""
-
 import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -47,7 +12,6 @@ BASE_OPTS = {
     "no_warnings": True,
     "skip_download": True,
     "noplaylist": True,
-    # bgutil plugin reads this to know where the PO token provider server is
     "extractor_args": {
         "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
     },
@@ -99,10 +63,8 @@ def get_download_url(
 
     info = extract(url, {"format": format_selector})
 
-    # When a single format is resolved, yt-dlp puts the direct stream URL here
     direct_url = info.get("url")
     if not direct_url and info.get("requested_formats"):
-        # merged formats (video+audio) don't have one single url
         direct_url = info["requested_formats"][0].get("url")
 
     if not direct_url:
@@ -114,9 +76,3 @@ def get_download_url(
         "url": direct_url,
         "filesize": info.get("filesize") or info.get("filesize_approx"),
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, hos
-                t="0.0.0.0", port=8000)
