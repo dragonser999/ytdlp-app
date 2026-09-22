@@ -1,8 +1,5 @@
 {
-  "builds": [
-    { "src": "ytdlp_api.py", "use": "@vercel/python" }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "ytdlp_api.py" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ]
 }
