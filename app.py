@@ -47,10 +47,12 @@ def base_opts(extra: dict) -> dict:
         "noplaylist": True,
         **extra,
     }
+    # Spoofing the client as TV/web_safari often avoids the bot-check
+    # without needing cookies or an account at all.
+    extractor_args = {"youtube": {"player_client": ["tv", "web_safari"]}}
     if POT_PROVIDER_URL:
-        opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
-        }
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
+    opts["extractor_args"] = extractor_args
     return opts
 
 
