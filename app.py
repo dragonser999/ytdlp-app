@@ -65,8 +65,11 @@ def base_opts(extra: dict) -> dict:
     # so it can complete whichever client needs a token.
     if POT_PROVIDER_URL:
         opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
+            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]},
+            "youtube": {"player_client": ["android"]},
         }
+    else:
+        opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
     if COOKIES_B64 and os.path.exists(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
     return opts
@@ -103,7 +106,7 @@ def do_merge(url: str, quality: str) -> tuple:
         format_selector = "bestvideo+bestaudio/best"
     else:
         height = quality.replace("p", "")
-        format_selector = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+        format_selector = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
 
     opts = base_opts({
         "format": format_selector,
