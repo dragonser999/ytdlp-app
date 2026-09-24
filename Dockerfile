@@ -1,8 +1,15 @@
 FROM python:3.11-slim
 
 # ffmpeg is needed to merge separate video+audio streams into one file
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# curl + unzip are needed to install Deno below
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp now needs a JS runtime to solve YouTube's signature/challenge
+# scripts. Without this, extraction fails with odd errors like
+# "The page needs to be reloaded."
+RUN curl -fsSL https://deno.land/install.sh | sh
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
