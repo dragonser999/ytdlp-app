@@ -22,6 +22,7 @@ Files in /tmp/downloads are auto-deleted 15 minutes after creation.
 
 import os
 import uuid
+import base64
 import threading
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -36,6 +37,18 @@ FILE_TTL_SECONDS = 15 * 60
 CREATOR = "ansadser"
 
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL")  # optional
+
+# Cookies (optional, base64-encoded in the COOKIES_B64 env var so the
+# real cookies.txt never has to be committed to the public repo).
+COOKIES_FILE_PATH = "/tmp/cookies.txt"
+COOKIES_B64 = os.environ.get("COOKIES_B64")
+if COOKIES_B64:
+    try:
+        with open(COOKIES_FILE_PATH, "wb") as f:
+            f.write(base64.b64decode(COOKIES_B64))
+    except Exception as e:
+        print(f"Failed to decode COOKIES_B64: {e}")
+        COOKIES_B64 = None
 
 QUALITIES = ["1080p", "720p", "480p", "360p", "144p"]
 
@@ -54,6 +67,8 @@ def base_opts(extra: dict) -> dict:
         opts["extractor_args"] = {
             "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
         }
+    if COOKIES_B64 and os.path.exists(COOKIES_FILE_PATH):
+        opts["cookiefile"] = COOKIES_FILE_PATH
     return opts
 
 
