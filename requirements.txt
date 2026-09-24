@@ -3,3 +3,5 @@ uvicorn
 yt-dlp
 python-multipart
 bgutil-ytdlp-pot-provider
+httpx
+
