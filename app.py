@@ -47,12 +47,13 @@ def base_opts(extra: dict) -> dict:
         "noplaylist": True,
         **extra,
     }
-    # Spoofing the client as TV/web_safari often avoids the bot-check
-    # without needing cookies or an account at all.
-    extractor_args = {"youtube": {"player_client": ["tv", "web_safari"]}}
+    # Let yt-dlp pick the best client automatically (its defaults handle
+    # this better than forcing one) — just supply the PO token provider
+    # so it can complete whichever client needs a token.
     if POT_PROVIDER_URL:
-        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
-    opts["extractor_args"] = extractor_args
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
+        }
     return opts
 
 
