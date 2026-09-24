@@ -1,29 +1,29 @@
 """
 Runs on Koyeb (persistent container with ffmpeg).
 
+STRATEGY:
+   1. Try Cobalt API (public instances) first — they already solve
+      YouTube's bot-detection robustly and often return an instant
+      direct download link.
+   2. If Cobalt fails, fall back to local yt-dlp (with PO token
+      provider + proxy + optional cookies, all configured via env vars).
+
 ENDPOINTS:
    GET /api/search?q=...&limit=19
    GET /api/info?url=...
-       -> lists available qualities with URLs pointing back to /api/fetch
-          (actual download+merge happens lazily when that URL is opened)
    GET /api/fetch?url=...&quality=720p&format=mp4
-       -> does the real download+merge (or audio extraction) and streams
-          the file back directly (this is what the links in /api/info
-          "downloads" point to)
-   GET /api/download?url=...&quality=best
-       -> downloads + merges now, returns {"status","download","creator"}
+   GET /api/download?url=...
    GET /api/audio?url=...
-       -> downloads + converts to mp3 now, returns {"status","Audio_url","creator"}
    GET /files/{filename}
-       -> serves an already-merged file (used internally by /api/download, /api/audio)
-
-Files in /tmp/downloads are auto-deleted 15 minutes after creation.
 """
 
 import os
+import re
 import uuid
 import base64
+import asyncio
 import threading
+import httpx
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, FileResponse
@@ -36,11 +36,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 FILE_TTL_SECONDS = 15 * 60
 CREATOR = "ansadser"
 
-POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL")  # optional
-PROXY_URL = os.environ.get("PROXY_URL")  # optional, e.g. http://user:pass@host:443
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL")
+PROXY_URL = os.environ.get("PROXY_URL")
 
-# Cookies (optional, base64-encoded in the COOKIES_B64 env var so the
-# real cookies.txt never has to be committed to the public repo).
 COOKIES_FILE_PATH = "/tmp/cookies.txt"
 COOKIES_B64 = os.environ.get("COOKIES_B64")
 if COOKIES_B64:
@@ -53,6 +51,31 @@ if COOKIES_B64:
 
 QUALITIES = ["1080p", "720p", "480p", "360p", "144p"]
 
+COBALT_APIS = [
+    "https://cobalt.api.scity.gov.mn",
+    "https://co.wuk.sh",
+    "https://cobalt.tools",
+    "https://nuko-c.meowing.de",
+    "https://subito-c.meowing.de",
+    "https://melon.clxxped.lol",
+    "https://api-cobalt.eversiege.network",
+    "https://api.qwkuns.me",
+    "https://kitty.tame.gg",
+]
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+
+def clean_media_url(raw_url: str) -> str:
+    if not raw_url:
+        return raw_url
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{6,})", raw_url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    return raw_url.split("?")[0]
+
+
+# ---------- yt-dlp fallback helpers ----------
 
 def base_opts(extra: dict) -> dict:
     opts = {
@@ -61,9 +84,6 @@ def base_opts(extra: dict) -> dict:
         "noplaylist": True,
         **extra,
     }
-    # Let yt-dlp pick the best client automatically (its defaults handle
-    # this better than forcing one) — just supply the PO token provider
-    # so it can complete whichever client needs a token.
     if POT_PROVIDER_URL:
         opts["extractor_args"] = {
             "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
@@ -97,36 +117,36 @@ def format_duration(seconds):
     return f"{m}:{s:02d}"
 
 
-def do_merge(url: str, quality: str) -> tuple:
-    """Downloads + merges video, returns (final_path, info)."""
+def ytdlp_get_info(url: str) -> dict:
+    opts = base_opts({"skip_download": True})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def ytdlp_merge(url: str, quality: str) -> tuple:
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-
     if quality == "best":
         format_selector = "bestvideo+bestaudio/best"
     else:
         height = quality.replace("p", "")
         format_selector = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
-
     opts = base_opts({
         "format": format_selector,
         "merge_output_format": "mp4",
         "outtmpl": output_template,
     })
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         final_path = ydl.prepare_filename(info)
         if not final_path.endswith(".mp4"):
             final_path = os.path.splitext(final_path)[0] + ".mp4"
-    return final_path, info
+    return final_path, info.get("title", "video")
 
 
-def do_audio(url: str) -> tuple:
-    """Downloads + converts to mp3, returns (final_path, info)."""
+def ytdlp_audio(url: str) -> tuple:
     file_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-
     opts = base_opts({
         "format": "bestaudio/best",
         "outtmpl": output_template,
@@ -136,11 +156,82 @@ def do_audio(url: str) -> tuple:
             "preferredquality": "192",
         }],
     })
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         final_path = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-    return final_path, info
+    return final_path, info.get("title", "audio")
+
+
+# ---------- Cobalt (primary strategy) ----------
+
+async def cobalt_resolve(url: str, mode: str) -> dict | None:
+    """Ask all Cobalt instances in parallel, return the first one that
+    resolves a direct URL, or None if all fail."""
+    target = clean_media_url(url)
+    payload = {"url": target, "videoQuality": "720"}
+    if mode == "audio":
+        payload["downloadMode"] = "audio"
+        payload["audioFormat"] = "mp3"
+
+    async def call(api: str):
+        async with httpx.AsyncClient(timeout=9) as client:
+            r = await client.post(
+                api, json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT},
+            )
+            data = r.json()
+            if data and data.get("status") in ("tunnel", "redirect") and data.get("url"):
+                return data
+            raise ValueError("no usable url")
+
+    tasks = [asyncio.create_task(call(api)) for api in COBALT_APIS]
+    for coro in asyncio.as_completed(tasks):
+        try:
+            result = await coro
+            for t in tasks:
+                t.cancel()
+            return result
+        except Exception:
+            continue
+    return None
+
+
+async def cobalt_download_file(direct_url: str, ext_hint: str) -> str:
+    file_id = str(uuid.uuid4())
+    final_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.{ext_hint}")
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        async with client.stream("GET", direct_url, headers={"User-Agent": USER_AGENT}) as resp:
+            with open(final_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
+                    f.write(chunk)
+    if not os.path.exists(final_path) or os.path.getsize(final_path) < 100:
+        raise HTTPException(status_code=500, detail="Cobalt download produced an empty file")
+    return final_path
+
+
+async def get_media(url: str, mode: str, quality: str = "720p") -> tuple:
+    """
+    Tries Cobalt first, then falls back to local yt-dlp.
+    Returns (file_path, title).
+    """
+    # 1) Try Cobalt
+    try:
+        resolved = await cobalt_resolve(url, mode)
+        if resolved:
+            ext = "mp3" if mode == "audio" else "mp4"
+            fname = resolved.get("filename", "")
+            if fname and "." in fname:
+                ext = fname.rsplit(".", 1)[-1]
+            path = await cobalt_download_file(resolved["url"], ext)
+            title = os.path.splitext(resolved.get("filename", "media"))[0]
+            return path, title
+    except Exception as e:
+        print(f"Cobalt failed: {e}")
+
+    # 2) Fallback to yt-dlp
+    if mode == "audio":
+        return await asyncio.to_thread(ytdlp_audio, url)
+    return await asyncio.to_thread(ytdlp_merge, url, quality)
 
 
 # ---------- SEARCH ----------
@@ -181,16 +272,14 @@ def search_youtube(q: str = Query(...), limit: int = Query(19)):
     })
 
 
-# ---------- INFO (lists qualities, lazy links) ----------
+# ---------- INFO ----------
 
 @app.get("/api/info")
-def api_info(request: Request, url: str = Query(...)):
-    opts = base_opts({"skip_download": True})
+async def api_info(request: Request, url: str = Query(...)):
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        info = await asyncio.to_thread(ytdlp_get_info, url)
+    except yt_dlp.utils.DownloadError:
+        info = None
 
     base = str(request.base_url)
     downloads = []
@@ -206,30 +295,40 @@ def api_info(request: Request, url: str = Query(...)):
         "url": f"{base}api/fetch?url={url}&format=mp3",
     })
 
+    if info:
+        return JSONResponse({
+            "status": True,
+            "result": {
+                "title": info.get("title"),
+                "videoId": info.get("id"),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "cached": False,
+                "downloads": downloads,
+            },
+        })
+
+    # metadata blocked, but downloads may still work via Cobalt
     return JSONResponse({
         "status": True,
         "result": {
-            "title": info.get("title"),
-            "videoId": info.get("id"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
+            "title": None,
+            "videoId": None,
+            "duration": None,
+            "thumbnail": None,
             "cached": False,
             "downloads": downloads,
         },
     })
 
 
-# ---------- FETCH (actually does the work, streams file back) ----------
+# ---------- FETCH (does the real work, streams file back) ----------
 
 @app.get("/api/fetch")
-def api_fetch(url: str = Query(...), quality: str = Query("best"), format: str = Query("mp4")):
+async def api_fetch(url: str = Query(...), quality: str = Query("720p"), format: str = Query("mp4")):
+    mode = "audio" if format == "mp3" else "video"
     try:
-        if format == "mp3":
-            final_path, info = do_audio(url)
-            media_type = "audio/mpeg"
-        else:
-            final_path, info = do_merge(url, quality)
-            media_type = "video/mp4"
+        final_path, title = await get_media(url, mode, quality)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -237,21 +336,19 @@ def api_fetch(url: str = Query(...), quality: str = Query("best"), format: str =
         raise HTTPException(status_code=500, detail="Processing failed, file not found")
 
     schedule_cleanup(final_path)
-    title = info.get("title", "file")
+    media_type = "audio/mpeg" if format == "mp3" else "video/mp4"
     ext = "mp3" if format == "mp3" else "mp4"
     return FileResponse(final_path, media_type=media_type, filename=f"{title}.{ext}")
 
 
-# ---------- DOWNLOAD (lists all quality links together) ----------
+# ---------- DOWNLOAD (lists all quality links) ----------
 
 @app.get("/api/download")
-def api_download(request: Request, url: str = Query(...)):
-    opts = base_opts({"skip_download": True})
+async def api_download(request: Request, url: str = Query(...)):
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        info = await asyncio.to_thread(ytdlp_get_info, url)
+    except yt_dlp.utils.DownloadError:
+        info = {}
 
     base = str(request.base_url)
     downloads = []
@@ -265,18 +362,18 @@ def api_download(request: Request, url: str = Query(...)):
     return JSONResponse({
         "status": "success",
         "creator": CREATOR,
-        "title": info.get("title"),
-        "duration": info.get("duration"),
+        "title": info.get("title") if info else None,
+        "duration": info.get("duration") if info else None,
         "downloads": downloads,
     })
 
 
-# ---------- AUDIO (JSON with a link) ----------
+# ---------- AUDIO ----------
 
 @app.get("/api/audio")
-def api_audio(request: Request, url: str = Query(...)):
+async def api_audio(request: Request, url: str = Query(...)):
     try:
-        final_path, info = do_audio(url)
+        final_path, title = await get_media(url, "audio")
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
