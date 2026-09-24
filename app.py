@@ -37,6 +37,7 @@ FILE_TTL_SECONDS = 15 * 60
 CREATOR = "ansadser"
 
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL")  # optional
+PROXY_URL = os.environ.get("PROXY_URL")  # optional, e.g. http://user:pass@host:443
 
 # Cookies (optional, base64-encoded in the COOKIES_B64 env var so the
 # real cookies.txt never has to be committed to the public repo).
@@ -65,13 +66,12 @@ def base_opts(extra: dict) -> dict:
     # so it can complete whichever client needs a token.
     if POT_PROVIDER_URL:
         opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]},
-            "youtube": {"player_client": ["android"]},
+            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
         }
-    else:
-        opts["extractor_args"] = {"youtube": {"player_client": ["android"]}}
     if COOKIES_B64 and os.path.exists(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     return opts
 
 
